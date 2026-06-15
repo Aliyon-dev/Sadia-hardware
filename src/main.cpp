@@ -3,28 +3,24 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <Adafruit_NeoPixel.h>
-#include "DispenserControl.h"
 
 #define RGB_PIN 48
 #define NUM_PIXELS 1
 
-// Servo, IN1-IN4 pin definitions are in control.h for easier sharing with control.cpp
-DispenserControl dispenser(9, 4,5,6,7);
+// Serial1 communication with Mega
+#define MEGA_RX_PIN 17
+#define MEGA_TX_PIN 18
+
+Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 #define SERVICE_UUID       "12345678-1234-1234-1234-1234567890ab"
 #define COMMAND_UUID       "12345678-1234-1234-1234-1234567890ac"
 #define TIME_SYNC_UUID     "12345678-1234-1234-1234-1234567890ad"
 #define SCHEDULE_UUID      "0000a3fe-0000-1000-8000-00805f9b34fb"
 
-Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
-
 BLECharacteristic *commandCharacteristic;
 BLECharacteristic *timeSyncCharacteristic;
 BLECharacteristic *scheduleCharacteristic;
-
-const int TUBE_1 = 0;
-const int TUBE_2 = 682;   // ~120 degrees if 2048 steps/rev
-const int TUBE_3 = 1365;  // ~240 degrees if 2048 steps/rev
 
 bool deviceConnected = false;
 
@@ -34,6 +30,15 @@ bool blinkState = false;
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
   pixel.setPixelColor(0, pixel.Color(r, g, b));
   pixel.show();
+}
+
+void checkMegaResponse() {
+  if (Serial1.available()) {
+    String response = Serial1.readStringUntil('\n');
+    response.trim();
+    Serial.print("[Mega Response] ");
+    Serial.println(response);
+  }
 }
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -55,29 +60,49 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
     String value = pCharacteristic->getValue().c_str();
     value.trim();
 
-    Serial.print("Command received: ");
+    Serial.print("BLE Command received: ");
     Serial.println(value);
 
-    if (value == "DISPENSE") {
-      Serial.println("Simulating dispense");
-      dispenser.dispenseTo(TUBE_2, 90);
-      delay(2000); // Example: dispense from tube 2 with gate open at 90 degrees 
-
-      for (int i = 0; i < 6; i++) {
-        setColor(255, 180, 0); // Yellow
-        delay(100);
-        setColor(0, 0, 0); // Off
-        delay(100);
-      }
-
-      if (deviceConnected) {
-        setColor(0, 255, 0); // Back to green
-      } else {
-        setColor(0, 0, 0);
-      }
+    if (value == "DISPENSE_1") {
+      Serial.println("Relaying to Mega: DISPENSE_1");
+      Serial1.println("DISPENSE_1");
+      flashLED();
+    }
+    else if (value == "DISPENSE_2") {
+      Serial.println("Relaying to Mega: DISPENSE_2");
+      Serial1.println("DISPENSE_2");
+      flashLED();
+    }
+    else if (value == "DISPENSE_3") {
+      Serial.println("Relaying to Mega: DISPENSE_3");
+      Serial1.println("DISPENSE_3");
+      flashLED();
+    }
+    else if (value == "DISPENSE_4") {
+      Serial.println("Relaying to Mega: DISPENSE_4");
+      Serial1.println("DISPENSE_4");
+      flashLED();
+    }
+    else {
+      Serial.println("Unknown command");
     }
   }
 };
+
+void flashLED() {
+  for (int i = 0; i < 6; i++) {
+    setColor(255, 180, 0); // Yellow
+    delay(100);
+    setColor(0, 0, 0); // Off
+    delay(100);
+  }
+
+  if (deviceConnected) {
+    setColor(0, 255, 0); // Back to green
+  } else {
+    setColor(0, 0, 0);
+  }
+}
 
 class TimeSyncCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
@@ -138,20 +163,22 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
 
 void setup() {
   Serial.begin(115200);
-  dispenser.begin();
+  delay(2000);
 
-  //mechanical homing
-  dispenser.setHome();
+  Serial.println("\n\n=== SMART PILL DISPENSER (BLE Relay) ===");
 
-  //Servo closed 
-  dispenser.setServoClosedAngle(0);
-  dispenser.setGateDelay(1000, 400);
+  // Initialize Serial1 for Mega communication
+  Serial1.begin(115200, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
+  delay(500);
+  Serial.println("✓ Connected to Arduino Mega via Serial1");
 
+  // Initialize LED
   pixel.begin();
   pixel.setBrightness(40);
   pixel.show();
   setColor(0, 0, 0);
 
+  // Initialize BLE
   BLEDevice::init("ZAM_MED_01");
 
   BLEServer *pServer = BLEDevice::createServer();
@@ -184,10 +211,13 @@ void setup() {
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
 
-  Serial.println("BLE dispenser ready");
+  Serial.println("✓ BLE relay ready");
 }
 
 void loop() {
+  // Monitor Mega responses
+  checkMegaResponse();
+
   if (!deviceConnected) {
     unsigned long now = millis();
 
@@ -203,4 +233,6 @@ void loop() {
       lastBlink = now;
     }
   }
+
+  delay(10);
 }
