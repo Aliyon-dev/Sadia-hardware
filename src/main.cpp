@@ -32,6 +32,21 @@ void setColor(uint8_t r, uint8_t g, uint8_t b) {
   pixel.show();
 }
 
+void flashLED() {
+  for (int i = 0; i < 6; i++) {
+    setColor(255, 180, 0); // Yellow
+    delay(100);
+    setColor(0, 0, 0); // Off
+    delay(100);
+  }
+
+  if (deviceConnected) {
+    setColor(0, 255, 0); // Back to green
+  } else {
+    setColor(0, 0, 0);
+  }
+}
+
 void checkMegaResponse() {
   if (Serial1.available()) {
     String response = Serial1.readStringUntil('\n');
@@ -89,20 +104,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-void flashLED() {
-  for (int i = 0; i < 6; i++) {
-    setColor(255, 180, 0); // Yellow
-    delay(100);
-    setColor(0, 0, 0); // Off
-    delay(100);
-  }
 
-  if (deviceConnected) {
-    setColor(0, 255, 0); // Back to green
-  } else {
-    setColor(0, 0, 0);
-  }
-}
 
 class TimeSyncCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
@@ -146,6 +148,9 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
 
     Serial.print("Schedule/message received: ");
     Serial.println(value);
+    Serial.print("Length: ");
+    Serial.println(value.length());
+    Serial1.println(value); // Relay to Mega
 
     // For now just log raw incoming base64 text.
     // Later you can decode base64 + parse JSON here.
@@ -168,7 +173,7 @@ void setup() {
   Serial.println("\n\n=== SMART PILL DISPENSER (BLE Relay) ===");
 
   // Initialize Serial1 for Mega communication
-  Serial1.begin(115200, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
+  Serial1.begin(115200, SERIAL_8N1, MEGA_TX_PIN, MEGA_RX_PIN);
   delay(500);
   Serial.println("✓ Connected to Arduino Mega via Serial1");
 
