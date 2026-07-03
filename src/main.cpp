@@ -11,6 +11,10 @@
 #define MEGA_RX_PIN 17
 #define MEGA_TX_PIN 18
 
+// Digital switch (MOSFET/relay) that powers the Mega
+#define MEGA_POWER_PIN 4
+#define MEGA_POWER_ON_LEVEL HIGH  // set to LOW if using an active-low relay module
+
 Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 #define SERVICE_UUID       "12345678-1234-1234-1234-1234567890ab"
@@ -47,12 +51,99 @@ void flashLED() {
   }
 }
 
-void checkMegaResponse() {
-  if (Serial1.available()) {
-    String response = Serial1.readStringUntil('\n');
+// --- Mega power management ---
+// The Mega is normally unpowered. When a command arrives we switch it on,
+// wait for it to boot (it should print "READY"), send the command, wait for
+// "DONE", then cut power again after a short idle grace period.
+
+enum MegaState { MEGA_OFF, MEGA_BOOTING, MEGA_IDLE, MEGA_BUSY };
+MegaState megaState = MEGA_OFF;
+unsigned long megaStateSince = 0;
+String pendingCommand = "";
+
+const unsigned long MEGA_BOOT_TIMEOUT_MS = 4000;      // send anyway if no READY
+const unsigned long MEGA_DISPENSE_TIMEOUT_MS = 60000; // give up waiting for DONE
+const unsigned long MEGA_IDLE_TIMEOUT_MS = 10000;     // power off after inactivity
+
+void megaPowerOn() {
+  Serial1.begin(115200, SERIAL_8N1, MEGA_TX_PIN, MEGA_RX_PIN);
+  digitalWrite(MEGA_POWER_PIN, MEGA_POWER_ON_LEVEL);
+  megaState = MEGA_BOOTING;
+  megaStateSince = millis();
+  Serial.println("[Power] Mega ON, waiting for boot");
+}
+
+void megaPowerOff() {
+  digitalWrite(MEGA_POWER_PIN, !MEGA_POWER_ON_LEVEL);
+  Serial1.end();
+  // Hold our TX line low: a UART line idling high would back-power
+  // the unpowered Mega through its input protection diodes.
+  pinMode(MEGA_RX_PIN, OUTPUT);
+  digitalWrite(MEGA_RX_PIN, LOW);
+  megaState = MEGA_OFF;
+  Serial.println("[Power] Mega OFF");
+}
+
+void queueMegaCommand(const String &cmd) {
+  if (pendingCommand.length()) {
+    Serial.println("[Mega] Warning: replacing pending command " + pendingCommand);
+  }
+  pendingCommand = cmd;
+  if (megaState == MEGA_OFF) {
+    megaPowerOn();
+  }
+}
+
+void serviceMega() {
+  String response = "";
+  if (megaState != MEGA_OFF && Serial1.available()) {
+    response = Serial1.readStringUntil('\n');
     response.trim();
-    Serial.print("[Mega Response] ");
-    Serial.println(response);
+    if (response.length()) {
+      Serial.print("[Mega Response] ");
+      Serial.println(response);
+    }
+  }
+
+  unsigned long now = millis();
+
+  switch (megaState) {
+    case MEGA_OFF:
+      break;
+
+    case MEGA_BOOTING:
+      if (response == "READY") {
+        megaState = MEGA_IDLE;
+        megaStateSince = now;
+      } else if (now - megaStateSince >= MEGA_BOOT_TIMEOUT_MS) {
+        Serial.println("[Mega] No READY, assuming booted");
+        megaState = MEGA_IDLE;
+        megaStateSince = now;
+      }
+      break;
+
+    case MEGA_IDLE:
+      if (pendingCommand.length()) {
+        Serial.println("Relaying to Mega: " + pendingCommand);
+        Serial1.println(pendingCommand);
+        pendingCommand = "";
+        megaState = MEGA_BUSY;
+        megaStateSince = now;
+      } else if (now - megaStateSince >= MEGA_IDLE_TIMEOUT_MS) {
+        megaPowerOff();
+      }
+      break;
+
+    case MEGA_BUSY:
+      if (response.startsWith("DONE")) {
+        megaState = MEGA_IDLE;
+        megaStateSince = now;
+      } else if (now - megaStateSince >= MEGA_DISPENSE_TIMEOUT_MS) {
+        Serial.println("[Mega] Timeout waiting for DONE");
+        megaState = MEGA_IDLE;
+        megaStateSince = now;
+      }
+      break;
   }
 }
 
@@ -78,24 +169,9 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
     Serial.print("BLE Command received: ");
     Serial.println(value);
 
-    if (value == "DISPENSE_1") {
-      Serial.println("Relaying to Mega: DISPENSE_1");
-      Serial1.println("DISPENSE_1");
-      flashLED();
-    }
-    else if (value == "DISPENSE_2") {
-      Serial.println("Relaying to Mega: DISPENSE_2");
-      Serial1.println("DISPENSE_2");
-      flashLED();
-    }
-    else if (value == "DISPENSE_3") {
-      Serial.println("Relaying to Mega: DISPENSE_3");
-      Serial1.println("DISPENSE_3");
-      flashLED();
-    }
-    else if (value == "DISPENSE_4") {
-      Serial.println("Relaying to Mega: DISPENSE_4");
-      Serial1.println("DISPENSE_4");
+    if (value == "DISPENSE_1" || value == "DISPENSE_2" ||
+        value == "DISPENSE_3" || value == "DISPENSE_4") {
+      queueMegaCommand(value);
       flashLED();
     }
     else {
@@ -150,7 +226,7 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
     Serial.println(value);
     Serial.print("Length: ");
     Serial.println(value.length());
-    Serial1.println(value); // Relay to Mega
+    queueMegaCommand(value); // Relay to Mega (powers it on if needed)
 
     // For now just log raw incoming base64 text.
     // Later you can decode base64 + parse JSON here.
@@ -172,10 +248,12 @@ void setup() {
 
   Serial.println("\n\n=== SMART PILL DISPENSER (BLE Relay) ===");
 
-  // Initialize Serial1 for Mega communication
-  Serial1.begin(115200, SERIAL_8N1, MEGA_TX_PIN, MEGA_RX_PIN);
-  delay(500);
-  Serial.println("✓ Connected to Arduino Mega via Serial1");
+  // Mega starts powered off; Serial1 is opened on demand in megaPowerOn()
+  pinMode(MEGA_POWER_PIN, OUTPUT);
+  digitalWrite(MEGA_POWER_PIN, !MEGA_POWER_ON_LEVEL);
+  pinMode(MEGA_RX_PIN, OUTPUT);
+  digitalWrite(MEGA_RX_PIN, LOW); // keep TX line low so the off Mega isn't back-powered
+  Serial.println("✓ Mega power control ready (Mega OFF)");
 
   // Initialize LED
   pixel.begin();
@@ -220,8 +298,8 @@ void setup() {
 }
 
 void loop() {
-  // Monitor Mega responses
-  checkMegaResponse();
+  // Drive Mega power state machine and monitor its responses
+  serviceMega();
 
   if (!deviceConnected) {
     unsigned long now = millis();
