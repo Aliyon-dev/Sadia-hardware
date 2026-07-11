@@ -1,8 +1,10 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <Adafruit_NeoPixel.h>
+#include "RTClib.h"
 
 #define RGB_PIN 48
 #define NUM_PIXELS 1
@@ -16,6 +18,7 @@
 #define MEGA_POWER_ON_LEVEL HIGH  // set to LOW if using an active-low relay module
 
 Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
+RTC_DS3231 rtc;
 
 #define SERVICE_UUID       "12345678-1234-1234-1234-1234567890ab"
 #define COMMAND_UUID       "12345678-1234-1234-1234-1234567890ac"
@@ -49,6 +52,14 @@ void flashLED() {
   } else {
     setColor(0, 0, 0);
   }
+}
+
+void printCurrentTime() {
+  DateTime now = rtc.now();
+  Serial.printf(
+    "[RTC] %04d/%02d/%02d %02d:%02d:%02d\n",
+    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second()
+  );
 }
 
 // --- Mega power management ---
@@ -203,6 +214,10 @@ class TimeSyncCallbacks : public BLECharacteristicCallbacks {
         2000 + year, month + 1, day, hour, minute, second, dayOfWeek
       );
 
+      rtc.adjust(DateTime(2000 + year, month + 1, day, hour, minute, second));
+      Serial.println("RTC updated from BLE time sync");
+      printCurrentTime();
+
       // quick blink to show activity
       for (int i = 0; i < 2; i++) {
         setColor(255, 180, 0);
@@ -247,6 +262,20 @@ void setup() {
   delay(2000);
 
   Serial.println("\n\n=== SMART PILL DISPENSER (BLE Relay) ===");
+
+  Wire.begin(8, 9);
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting compile time");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  printCurrentTime();
 
   // Mega starts powered off; Serial1 is opened on demand in megaPowerOn()
   pinMode(MEGA_POWER_PIN, OUTPUT);
