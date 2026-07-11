@@ -40,7 +40,8 @@ void setup() {
 
   Serial1.begin(115200);
   delay(100);
-  Serial.println("✓ Serial1 initialized - Waiting for commands from ESP32");
+  Serial.println("✓ Serial1 initialized - Waiting for commands from ESP32 RESPONSE READY");
+  Serial1.println("READY");
 }
 
 void loop() {
