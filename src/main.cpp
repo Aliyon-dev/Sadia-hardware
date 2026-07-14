@@ -4,6 +4,9 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include "mbedtls/base64.h"
 #include "RTClib.h"
 
 #define RGB_PIN 48
@@ -16,6 +19,8 @@
 // Digital switch (MOSFET/relay) that powers the Mega
 #define MEGA_POWER_PIN 4
 #define MEGA_POWER_ON_LEVEL HIGH  // set to LOW if using an active-low relay module
+
+#define BUZZER_PIN 13
 
 Adafruit_NeoPixel pixel(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 RTC_DS3231 rtc;
@@ -158,6 +163,227 @@ void serviceMega() {
   }
 }
 
+// --- Schedule storage (NVS flash) ---
+// Schedules are kept on the ESP32 (it has the RTC); the Mega is only powered
+// on to execute a dispense. Stored as a JSON array under "schedules".
+
+Preferences prefs;
+const char *PREFS_NAMESPACE = "sadia";
+const char *SCHEDULES_KEY = "schedules";
+
+bool scheduleCacheDirty = true; // reparse stored JSON on next check
+
+String loadSchedules() {
+  prefs.begin(PREFS_NAMESPACE, true);
+  String stored = prefs.getString(SCHEDULES_KEY, "[]");
+  prefs.end();
+  return stored;
+}
+
+void printStoredSchedules() {
+  Serial.println("[Schedules] Stored: " + loadSchedules());
+}
+
+void clearSchedules() {
+  prefs.begin(PREFS_NAMESPACE, false);
+  prefs.remove(SCHEDULES_KEY);
+  prefs.end();
+  scheduleCacheDirty = true;
+  Serial.println("[Schedules] Cleared");
+}
+
+// Payload may be a single schedule object (merged into the list, replacing an
+// existing entry with the same "id") or a full array (replaces the list).
+bool storeScheduleJson(const String &jsonText) {
+  JsonDocument incoming;
+  if (deserializeJson(incoming, jsonText)) {
+    return false;
+  }
+
+  String toStore;
+
+  if (incoming.is<JsonArray>()) {
+    toStore = jsonText;
+  } else if (incoming.is<JsonObject>()) {
+    JsonDocument db;
+    if (deserializeJson(db, loadSchedules()) || !db.is<JsonArray>()) {
+      db.to<JsonArray>();
+    }
+    JsonArray arr = db.as<JsonArray>();
+
+    bool replaced = false;
+    if (!incoming["id"].isNull()) {
+      for (JsonVariant entry : arr) {
+        if (entry["id"] == incoming["id"]) {
+          entry.set(incoming.as<JsonObject>());
+          replaced = true;
+          break;
+        }
+      }
+    }
+    if (!replaced) {
+      arr.add(incoming.as<JsonObject>());
+    }
+    serializeJson(arr, toStore);
+  } else {
+    return false;
+  }
+
+  prefs.begin(PREFS_NAMESPACE, false);
+  size_t written = prefs.putString(SCHEDULES_KEY, toStore);
+  prefs.end();
+
+  if (written == 0) {
+    Serial.println("[Schedules] ERROR: NVS write failed (payload too large?)");
+    return false;
+  }
+  scheduleCacheDirty = true;
+  Serial.printf("[Schedules] Saved %u bytes to flash\n", written);
+  return true;
+}
+
+// --- Buzzer alarm ---
+// Beeps 300ms on / 300ms off for BUZZER_DURATION_MS when a schedule fires.
+
+unsigned long buzzerStart = 0;
+bool buzzerActive = false;
+const unsigned long BUZZER_DURATION_MS = 15000;
+
+void startBuzzer() {
+  buzzerActive = true;
+  buzzerStart = millis();
+  Serial.println("[Buzzer] Ringing");
+}
+
+void stopBuzzer() {
+  buzzerActive = false;
+  noTone(BUZZER_PIN);
+}
+
+void serviceBuzzer() {
+  if (!buzzerActive) return;
+
+  unsigned long elapsed = millis() - buzzerStart;
+  if (elapsed >= BUZZER_DURATION_MS) {
+    stopBuzzer();
+    Serial.println("[Buzzer] Done");
+    return;
+  }
+
+  if ((elapsed / 300) % 2 == 0) {
+    tone(BUZZER_PIN, 2000);
+  } else {
+    noTone(BUZZER_PIN);
+  }
+}
+
+// --- Schedule alarm check ---
+// Stored JSON is parsed into a small cache of times; the RTC is polled once
+// per second and the buzzer fires when a schedule's hour:minute comes up.
+// App payload: [{"id":"...","hour":2,"period":"AM","pills":2}]
+// hour is 12-hour clock with AM/PM; no minute field means HH:00.
+// {"minute": 30} and {"time": "08:30"} are also accepted.
+
+const int MAX_SCHEDULES = 16;
+struct ScheduleTime { int hour; int minute; int pills; };
+ScheduleTime scheduleCache[MAX_SCHEDULES];
+int scheduleCount = 0;
+
+void rebuildScheduleCache() {
+  scheduleCacheDirty = false;
+  scheduleCount = 0;
+
+  JsonDocument db;
+  if (deserializeJson(db, loadSchedules()) || !db.is<JsonArray>()) return;
+
+  for (JsonObject entry : db.as<JsonArray>()) {
+    if (scheduleCount >= MAX_SCHEDULES) {
+      Serial.println("[Schedules] Warning: more entries than cache slots, extras ignored");
+      break;
+    }
+
+    int hour = entry["hour"] | -1;
+    int minute = entry["minute"] | 0; // app sends no minute -> fire at HH:00
+    if (hour < 0 && entry["time"].is<const char *>()) {
+      if (sscanf(entry["time"].as<const char *>(), "%d:%d", &hour, &minute) != 2) {
+        hour = -1;
+      }
+    }
+
+    // Convert 12-hour clock ("period": "AM"/"PM") to 24-hour
+    const char *period = entry["period"] | (const char *)nullptr;
+    if (period && hour >= 1 && hour <= 12) {
+      bool pm = (period[0] == 'P' || period[0] == 'p');
+      if (pm && hour != 12) hour += 12;
+      if (!pm && hour == 12) hour = 0;
+    }
+
+    if (hour >= 0 && hour < 24 && minute >= 0 && minute < 60) {
+      scheduleCache[scheduleCount].hour = hour;
+      scheduleCache[scheduleCount].minute = minute;
+      scheduleCache[scheduleCount].pills = entry["pills"] | 0;
+      Serial.printf("[Schedules] #%d -> %02d:%02d, %d pill(s)\n",
+                    scheduleCount + 1, hour, minute, scheduleCache[scheduleCount].pills);
+      scheduleCount++;
+    } else {
+      Serial.println("[Schedules] Entry without a valid time, skipped");
+    }
+  }
+  Serial.printf("[Schedules] %d timed entr%s active\n",
+                scheduleCount, scheduleCount == 1 ? "y" : "ies");
+}
+
+unsigned long lastScheduleCheck = 0;
+int prevMinuteOfDay = -1;
+bool triggeredThisMinute = false;
+
+void checkSchedules() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastScheduleCheck < 1000) return;
+  lastScheduleCheck = nowMs;
+
+  if (scheduleCacheDirty) rebuildScheduleCache();
+  if (scheduleCount == 0) return;
+
+  DateTime now = rtc.now();
+  int minuteOfDay = now.hour() * 60 + now.minute();
+  if (minuteOfDay != prevMinuteOfDay) {
+    prevMinuteOfDay = minuteOfDay;
+    triggeredThisMinute = false;
+  }
+  if (triggeredThisMinute) return;
+
+  for (int i = 0; i < scheduleCount; i++) {
+    if (scheduleCache[i].hour == now.hour() && scheduleCache[i].minute == now.minute()) {
+      triggeredThisMinute = true;
+      Serial.printf("[Alarm] Schedule matched %02d:%02d, %d pill(s) due\n",
+                    now.hour(), now.minute(), scheduleCache[i].pills);
+      startBuzzer();
+      break;
+    }
+  }
+}
+
+// Returns decoded text, or "" if the input isn't valid base64.
+String tryBase64Decode(const String &input) {
+  size_t outLen = 0;
+  mbedtls_base64_decode(nullptr, 0, &outLen,
+                        (const unsigned char *)input.c_str(), input.length());
+  if (outLen == 0) return "";
+
+  unsigned char *buf = (unsigned char *)malloc(outLen + 1);
+  if (!buf) return "";
+
+  String result = "";
+  if (mbedtls_base64_decode(buf, outLen, &outLen,
+                            (const unsigned char *)input.c_str(), input.length()) == 0) {
+    buf[outLen] = '\0';
+    result = String((char *)buf);
+  }
+  free(buf);
+  return result;
+}
+
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) override {
     deviceConnected = true;
@@ -172,6 +398,32 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
+// Plain-text commands, accepted on both the command and schedule
+// characteristics. Returns false if the value isn't a known command.
+bool handleTextCommand(const String &value) {
+  if (value == "DISPENSE_1" || value == "DISPENSE_2" ||
+      value == "DISPENSE_3" || value == "DISPENSE_4") {
+    queueMegaCommand(value);
+    flashLED();
+  }
+  else if (value == "LIST_SCHEDULES") {
+    printStoredSchedules();
+  }
+  else if (value == "CLEAR_SCHEDULES") {
+    clearSchedules();
+  }
+  else if (value == "TEST_BUZZER") {
+    startBuzzer();
+  }
+  else if (value == "STOP_BUZZER") {
+    stopBuzzer();
+  }
+  else {
+    return false;
+  }
+  return true;
+}
+
 class CommandCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
     String value = pCharacteristic->getValue().c_str();
@@ -180,12 +432,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
     Serial.print("BLE Command received: ");
     Serial.println(value);
 
-    if (value == "DISPENSE_1" || value == "DISPENSE_2" ||
-        value == "DISPENSE_3" || value == "DISPENSE_4") {
-      queueMegaCommand(value);
-      flashLED();
-    }
-    else {
+    if (!handleTextCommand(value)) {
       Serial.println("Unknown command");
     }
   }
@@ -237,14 +484,34 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
     String value = pCharacteristic->getValue().c_str();
 
-    Serial.print("Schedule/message received: ");
-    Serial.println(value);
-    Serial.print("Length: ");
-    Serial.println(value.length());
-    queueMegaCommand(value); // Relay to Mega (powers it on if needed)
+    value.trim();
 
-    // For now just log raw incoming base64 text.
-    // Later you can decode base64 + parse JSON here.
+    Serial.print("Schedule received (");
+    Serial.print(value.length());
+    Serial.println(" bytes): " + value);
+
+    // The app sends text commands on this characteristic too
+    if (handleTextCommand(value)) {
+      return;
+    }
+
+    // Accept plain JSON, or base64-wrapped JSON from the app.
+    String jsonText = value;
+    JsonDocument probe;
+    if (deserializeJson(probe, jsonText)) {
+      String decoded = tryBase64Decode(value);
+      if (decoded.length() && !deserializeJson(probe, decoded)) {
+        Serial.println("[Schedules] Decoded base64: " + decoded);
+        jsonText = decoded;
+      } else {
+        Serial.println("[Schedules] Payload is neither JSON nor base64 JSON, ignoring");
+        return;
+      }
+    }
+
+    if (storeScheduleJson(jsonText)) {
+      printStoredSchedules();
+    }
 
     for (int i = 0; i < 2; i++) {
       setColor(255, 180, 0);
@@ -277,12 +544,18 @@ void setup() {
   }
   printCurrentTime();
 
+  // Show what survived the reboot — this is the persistence test
+  printStoredSchedules();
+
   // Mega starts powered off; Serial1 is opened on demand in megaPowerOn()
   pinMode(MEGA_POWER_PIN, OUTPUT);
   digitalWrite(MEGA_POWER_PIN, !MEGA_POWER_ON_LEVEL);
   pinMode(MEGA_RX_PIN, OUTPUT);
   digitalWrite(MEGA_RX_PIN, LOW); // keep TX line low so the off Mega isn't back-powered
   Serial.println("✓ Mega power control ready (Mega OFF)");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
   // Initialize LED
   pixel.begin();
@@ -329,6 +602,10 @@ void setup() {
 void loop() {
   // Drive Mega power state machine and monitor its responses
   serviceMega();
+
+  // Fire the buzzer when a stored schedule's time comes up
+  checkSchedules();
+  serviceBuzzer();
 
   if (!deviceConnected) {
     unsigned long now = millis();
